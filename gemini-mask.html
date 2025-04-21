@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Gemini API Image Mask Visualization</title>
+  <!-- Bootstrap 5 CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+  <script type="module">
+    import { GoogleGenAI } from 'https://cdn.jsdelivr.net/npm/@google/genai@latest/+esm';
+    import { marked }     from 'https://esm.run/marked';
+
+    function getApiKey() {
+      let apiKey = localStorage.getItem("GEMINI_API_KEY");
+      if (!apiKey) {
+        apiKey = prompt("Please enter your Gemini API key:");
+        if (apiKey) {
+          localStorage.setItem("GEMINI_API_KEY", apiKey);
+        }
+      }
+      return apiKey;
+    }
+
+    // Instantiate the GenAI client once
+    const ai = new GoogleGenAI({ apiKey: getApiKey() });
+
+    async function resizeAndCompressImage(file) {
+      return new Promise(resolve => {
+        const reader = new FileReader();
+        reader.onload = function(event) {
+          const img = new Image();
+          img.onload = function() {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            let width = img.width;
+            let height = img.height;
+            if (width > 1000) {
+              height = Math.round((height * 1000) / width);
+              width = 1000;
+            }
+            canvas.width = width;
+            canvas.height = height;
+            ctx.drawImage(img, 0, 0, width, height);
+            canvas.toBlob(function(blob) {
+              resolve(new File([blob], 'compressed.jpg', { type: 'image/jpeg' }));
+            }, 'image/jpeg', 0.7);
+          };
+          img.src = event.target.result;
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function processImageAndPrompt() {
+      const fileInput   = document.getElementById('imageInput');
+      const promptInput = document.getElementById('promptInput');
+      const modelSelect = document.getElementById('modelSelect');
+      const resultDiv   = document.getElementById('result');
+      const usageDiv    = document.getElementById('tokenUsage');
+
+      if (!promptInput.value.trim()) {
+        alert('Please enter a prompt.');
+        return;
+      }
+      resultDiv.innerHTML = '<div class="spinner-border spinner-border-sm" role="status"><span class="visually-hidden">Loading...</span></div> Processing…';
+      usageDiv.textContent = '';
+
+      // Build the contents array
+      const contents = [ promptInput.value ];
+
+      if (fileInput.files && fileInput.files[0]) {
+        const compressed = await resizeAndCompressImage(fileInput.files[0]);
+        const part = await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onloadend = function() {
+            resolve({
+              inlineData: {
+                data: reader.result.split(',')[1],
+                mimeType: compressed.type
+              }
+            });
+          };
+          reader.readAsDataURL(compressed);
+        });
+        contents.push(part);
+      }
+
+      // Check if the selected option wants non‑thinking
+      const selectedOpt   = modelSelect.selectedOptions[0];
+      const isNonThinking = selectedOpt.dataset.nonThinking === 'true';
+      const modelName     = selectedOpt.value;
+
+      // Build request payload
+      const req = {
+        model:    modelName,
+        contents: contents
+      };
+      if (isNonThinking) {
+        req.config = {
+          thinkingConfig: { thinkingBudget: 0 }
+        };
+      }
+
+      try {
+        // Call the GenAI SDK
+        const response = await ai.models.generateContent(req);
+        const text     = response.text;
+        resultDiv.innerHTML = marked.parse(text);
+
+        // Display token usage
+        if (response.usageMetadata) {
+          const inTokens  = response.usageMetadata.promptTokenCount;
+          const outTokens = response.usageMetadata.candidatesTokenCount;
+          usageDiv.textContent =
+            `Input tokens: ${inTokens.toLocaleString()}  •  Output tokens: ${outTokens.toLocaleString()}`;
+        }
+
+        // If an image was provided, overlay boxes & masks
+        if (fileInput.files && fileInput.files[0]) {
+          const boxes = extractBoxAndMask(text);
+          if (boxes.length) {
+            displayImageWithBoundingBoxesAndMasks(fileInput.files[0], boxes);
+          }
+        }
+      } catch (error) {
+          console.error("Error processing request:", error);
+          resultDiv.innerHTML = `<div class="alert alert-danger" role="alert">Error: ${error.message}</div>`;
+      }
+    }
+
+
+
+/**
+ * Extracts JSON content delimited by specific markers or attempts to parse the whole string.
+ * @param {string} text The raw text potentially containing JSON.
+ * @returns {object | Array | null} The parsed JSON object/array, or null if extraction/parsing fails.
+ */
+function extractJsonFromString(text) {
+  const startMarker = "```json";
+  const endMarker = "```";
+  let jsonString = null;
+
+  const startIndex = text.indexOf(startMarker);
+  const endIndex = text.lastIndexOf(endMarker); // Use lastIndexOf for cases with nested ```
+
+  if (startIndex !== -1 && endIndex > startIndex) {
+    // Found markers, extract content between them
+    jsonString = text.substring(startIndex + startMarker.length, endIndex).trim();
+  } else {
+    // No markers found or invalid order, try parsing the whole text after trimming
+    const trimmedText = text.trim();
+    // Basic check if it looks like JSON before attempting to parse
+    if ((trimmedText.startsWith('{') && trimmedText.endsWith('}')) || (trimmedText.startsWith('[') && trimmedText.endsWith(']'))) {
+        jsonString = trimmedText;
+        console.warn("No ```json ``` markers found, attempting to parse entire trimmed text.");
+    } else {
+         console.warn("No JSON markers found and text doesn't appear to be JSON object/array.");
+         return null; // Neither markers nor likely JSON content found
+    }
+  }
+
+  if (!jsonString) {
+      console.warn("Could not extract a JSON string.");
+      return null;
+  }
+
+  try {
+    const parsedData = JSON.parse(jsonString);
+    return parsedData;
+  } catch (error) {
+    console.error("Failed to parse JSON:", error);
+    console.error("Attempted to parse string:", jsonString); // Log the problematic string
+    console.error("Original text:", text); // Log the original text for context
+    return null;
+  }
+}
+
+// Ensure extractBoxAndMask uses the updated function (no changes needed inside it)
+function extractBoxAndMask(text) {
+  const results = [];
+  const parsedData = extractJsonFromString(text); // Uses the updated function
+
+  if (!parsedData) {
+    // Warning already logged in extractJsonFromString if parsing failed
+    return []; // Return empty if extraction/parsing failed
+  }
+
+  // Ensure it's an array, handle if the root is an object with a relevant key if needed
+  if (!Array.isArray(parsedData)) {
+     // If the API might return an object containing the array, adjust here.
+     // Example: if (parsedData && Array.isArray(parsedData.results)) { parsedData = parsedData.results; }
+     console.warn("Parsed data is not an array. Received:", parsedData);
+     // Attempt to handle single object case if applicable
+     if (typeof parsedData === 'object' && parsedData !== null && parsedData.box_2d && parsedData.mask && parsedData.label) {
+        console.log("Handling single object result.");
+        results.push({
+            box: parsedData.box_2d,
+            mask: parsedData.mask,
+            label: parsedData.label
+        });
+        return results;
+     }
+     return []; // Otherwise, return empty
+  }
+
+  try {
+    parsedData.forEach(item => {
+      // Check item validity and required fields
+      if (item && typeof item === 'object' && item.box_2d && item.mask && item.label) {
+        results.push({
+          box: item.box_2d,
+          mask: item.mask,
+          label: item.label
+        });
+      } else {
+         console.warn("Skipping item due to missing fields, invalid type, or null item:", item);
+      }
+    });
+  } catch (e) {
+    // Catch potential errors during iteration/access, though primary parsing errors handled earlier
+    console.error("Error processing parsed JSON data array:", e);
+  }
+
+  return results;
+}
+
+function displayImageWithBoundingBoxesAndMasks(file, boxAndMaskData) {
+      const reader = new FileReader();
+      reader.onload = function(event) {
+        const image = new Image();
+        image.onload = function() {
+          const canvas = document.getElementById('canvas');
+          canvas.width  = image.width + 100;
+          canvas.height = image.height + 100;
+          const ctx = canvas.getContext('2d');
+
+          // Draw the base image
+          ctx.drawImage(image, 80, 20);
+
+          // Grid lines
+          ctx.strokeStyle = 'rgba(255, 0, 0, 0.5)';
+          ctx.lineWidth = 1;
+          for (let i = 0; i <= 1000; i += 100) {
+            const x = 80 + (i / 1000) * image.width;
+            ctx.beginPath(); ctx.moveTo(x, 20); ctx.lineTo(x, image.height + 20); ctx.stroke();
+          }
+          for (let i = 0; i <= 1000; i += 100) {
+            const y = 20 + ((1000 - i) / 1000) * image.height;
+            ctx.beginPath(); ctx.moveTo(80, y); ctx.lineTo(image.width + 80, y); ctx.stroke();
+          }
+
+          // Prepare preview rows
+          const boundingBoxImages = document.getElementById('boundingBoxImages');
+          boundingBoxImages.innerHTML = '';
+          const colors = ['#FF0000','#00FF00','#0000FF','#FFFF00','#FF00FF','#00FFFF'];
+
+          boxAndMaskData.forEach(function(data, index) {
+            const [ymin,xmin,ymax,xmax] = data.box;
+            const norm = (ymin>1000||xmin>1000||ymax>1000||xmax>1000)
+              ? [(ymin/image.height)*1000, (xmin/image.width)*1000, (ymax/image.height)*1000, (xmax/image.width)*1000]
+              : data.box;
+
+            const [nYmin,nXmin,nYmax,nXmax] = norm.map(v=>v/1000);
+            const wPx = (nXmax-nXmin)*image.width;
+            const hPx = (nYmax-nYmin)*image.height;
+            if (wPx===0||hPx===0) return;
+
+            // Overlay box
+            ctx.strokeStyle = colors[index%colors.length];
+            ctx.lineWidth   = 5;
+            ctx.strokeRect(nXmin*image.width+80, nYmin*image.height+20, wPx, hPx);
+
+			ctx.fillStyle = colors[index % colors.length]; // Use box color for text background
+			ctx.font = 'bold 18px Arial';
+			const textMetrics = ctx.measureText(data.label);
+			const textX = nXmin * image.width + 80;
+			const textY = nYmin * image.height + 20 - 5; // Position above the box
+			// Simple background rect for better visibility
+			ctx.fillRect(textX - 2, textY - textMetrics.actualBoundingBoxAscent - 2, textMetrics.width + 4, textMetrics.actualBoundingBoxAscent + textMetrics.actualBoundingBoxDescent + 4);
+			ctx.fillStyle = 'white'; // Text color
+			ctx.fillText(data.label, textX, textY);
+
+            // Overlay mask
+            const maskImg = new Image();
+            maskImg.onload = function() {
+              // --- Start: Updated Mask Drawing ---
+              ctx.save(); // Save current context state
+              // Set the composite operation to draw the color only where the mask is opaque
+              ctx.globalCompositeOperation = 'source-atop';
+              // Set fill color with desired opacity (e.g., '70' hex for ~44% opacity)
+              ctx.fillStyle = colors[index % colors.length] + '70';
+              // Draw the mask image first (acts as the shape)
+              ctx.drawImage(maskImg, nXmin*image.width+80, nYmin*image.height+20, wPx, hPx);
+              // Fill the area defined by the mask with the color
+              ctx.fillRect(nXmin*image.width+80, nYmin*image.height+20, wPx, hPx);
+              ctx.restore(); // Restore context state (resets globalCompositeOperation, fillStyle)
+              // --- End: Updated Mask Drawing ---
+
+
+              // --- Start: Build preview row ---
+              const MAX_H = 200;
+              const scale = MAX_H / hPx;
+              const scaledW = Math.round(wPx * scale);
+              const row = document.createElement('div');
+              row.className = 'bounding-box-container'; // Keep existing class
+
+              const label = document.createElement('p');
+               label.textContent = `${data.label}: [${data.box.join(', ')}]`; // Add the label here
+               label.className = 'fw-bold mb-2'; // Bootstrap class
+
+              row.appendChild(label);
+
+              const compare = document.createElement('div');
+              compare.className = 'image-comparison d-flex'; // Use Bootstrap flex
+              compare.style.gap = '10px'; // Adjusted gap for 4 columns
+
+              function makeCol(width, height) {
+                const col = document.createElement('div');
+                col.style.flex = '0 0 auto';
+                col.style.width = width + 'px';
+                col.style.height = height + 'px';
+                col.style.overflow = 'hidden';
+                col.classList.add('preview-col'); // Add class for styling/targeting
+                return col;
+              }
+
+              // Column 1: Cropped Original
+              const leftCol = makeCol(scaledW, MAX_H);
+              const cropCanvas = document.createElement('canvas');
+              cropCanvas.width  = wPx; cropCanvas.height = hPx;
+              const cropCtx = cropCanvas.getContext('2d');
+              cropCtx.drawImage(image, nXmin*image.width, nYmin*image.height, wPx, hPx, 0, 0, wPx, hPx);
+              const cropImg = document.createElement('img');
+              cropImg.src = cropCanvas.toDataURL('image/png');
+              Object.assign(cropImg.style, { width:'100%',height:'100%',objectFit:'fill' });
+              leftCol.appendChild(cropImg);
+
+              // Column 2: Mask Only
+              const middleCol = makeCol(scaledW, MAX_H);
+              middleCol.style.border = '2px solid ' + colors[index%colors.length];
+              const maskPrev = document.createElement('img');
+              maskPrev.src = data.mask;
+              Object.assign(maskPrev.style, { width:'100%',height:'100%',objectFit:'fill' });
+              middleCol.appendChild(maskPrev);
+
+              // --- Start: Column 3: Apply Mask (Black pixels in mask make original transparent) ---
+              const rightCol = makeCol(scaledW, MAX_H);
+              rightCol.classList.add('checkerboard-bg'); // Add class for checkerboard
+              const combinedCanvasMasking = document.createElement('canvas');
+              combinedCanvasMasking.width = wPx; combinedCanvasMasking.height = hPx;
+              const combinedCtxMasking = combinedCanvasMasking.getContext('2d');
+
+              // 1. Draw the original cropped image
+              combinedCtxMasking.drawImage(cropCanvas, 0, 0);
+              const combinedImageData = combinedCtxMasking.getImageData(0, 0, wPx, hPx);
+              const combinedData = combinedImageData.data;
+
+              // 2. Draw the mask image onto a temporary canvas to get its pixel data
+              const maskTempCanvas = document.createElement('canvas');
+              maskTempCanvas.width = wPx; maskTempCanvas.height = hPx;
+              const maskTempCtx = maskTempCanvas.getContext('2d');
+              maskTempCtx.drawImage(maskImg, 0, 0, wPx, hPx);
+              const maskImageData = maskTempCtx.getImageData(0, 0, wPx, hPx);
+              const maskData = maskImageData.data;
+
+              // 3. Apply mask logic: make original transparent where mask is black
+              for (let i = 0; i < combinedData.length; i += 4) {
+                // Check if the corresponding pixel in the mask is black (R=G=B=0)
+                if (maskData[i] === 0 && maskData[i + 1] === 0 && maskData[i + 2] === 0) {
+                  combinedData[i + 3] = 0; // Set alpha to 0 (transparent) in the combined image
+                }
+              }
+              // 4. Put the modified image data back
+              combinedCtxMasking.putImageData(combinedImageData, 0, 0);
+
+              // 5. Display the result
+              const combinedImgMasking = document.createElement('img');
+              combinedImgMasking.src = combinedCanvasMasking.toDataURL('image/png');
+              Object.assign(combinedImgMasking.style, { width:'100%',height:'100%',objectFit:'fill' });
+              rightCol.appendChild(combinedImgMasking);
+              // --- End: NEW Column 3 ---
+
+              compare.appendChild(leftCol);
+              compare.appendChild(middleCol);
+              compare.appendChild(rightCol);
+              row.appendChild(compare);
+              boundingBoxImages.appendChild(row);
+              // --- End: Build preview row ---
+            };
+            maskImg.src = data.mask; // Trigger mask load
+          });
+
+          // Axes & labels
+          ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.font = '26px Arial'; ctx.textAlign = 'right';
+          ctx.beginPath(); ctx.moveTo(80,20); ctx.lineTo(80,image.height+20); ctx.stroke();
+          for (let i=0;i<=1000;i+=100) {
+            const y = 20 + (i/1000)*image.height;
+            ctx.fillText(i.toString(),75,y+5);
+            ctx.beginPath(); ctx.moveTo(75,y); ctx.lineTo(80,y); ctx.stroke();
+          }
+          ctx.beginPath(); ctx.moveTo(80,image.height+20); ctx.lineTo(image.width+80,image.height+20); ctx.stroke();
+          ctx.textAlign = 'center';
+          for (let i=0;i<=1000;i+=100) {
+            const x = 80 + (i/1000)*image.width;
+            ctx.fillText(i.toString(),x,image.height+40);
+            ctx.beginPath(); ctx.moveTo(x,image.height+20); ctx.lineTo(x,image.height+25); ctx.stroke();
+          }
+        };
+        image.src = event.target.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
+
+    function clearImage() {
+      const input = document.getElementById('imageInput');
+      input.value = '';
+      const canvas = document.getElementById('canvas');
+      canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);
+      const img = document.getElementById('imagePreview');
+      img.src = '';
+      img.style.display = 'none';
+      document.getElementById('boundingBoxImages').innerHTML = '';
+      document.getElementById('tokenUsage').textContent = '';
+    }
+
+    function previewImage(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const img = document.getElementById('imagePreview');
+        img.src = e.target.result;
+        img.style.display = 'block';
+      };
+      reader.readAsDataURL(file);
+    }
+
+    // Attach event listeners after DOM is loaded
+    document.addEventListener('DOMContentLoaded', () => {
+        document.getElementById('submitBtn').addEventListener('click', processImageAndPrompt);
+        document.getElementById('clearImageBtn').addEventListener('click', clearImage);
+        document.getElementById('imageInput').addEventListener('change', previewImage);
+    });
+  </script>
+
+  <style>
+    body {
+        font-family: Arial, sans-serif;
+        background: white; /* Changed background to white */
+    }
+    #result {
+      margin-top: 20px;
+      border: 1px solid #ccc;
+      padding: 10px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      max-height: 500px;
+      overflow-y: auto;
+      background-color: #f8f9fa; /* Light background for result */
+    }
+    #tokenUsage {
+      margin-top: 8px;
+      font-size: 0.9em;
+      color: #555;
+    }
+    #canvas, #imagePreview { max-width: 100%; height: auto; display: block; margin: 1rem 0; }
+    #boundingBoxImages img { max-width: 100%; display: block; }
+    .bounding-box-container {
+      display: block;
+      margin-bottom: 30px;
+      border-bottom: 1px solid #eee;
+      padding-bottom: 20px;
+    }
+    /* Style for the checkerboard background on the third column */
+    .image-comparison .checkerboard-bg {
+        background-image: linear-gradient(45deg, #ccc 25%, transparent 25%),
+                          linear-gradient(-45deg, #ccc 25%, transparent 25%),
+                          linear-gradient(45deg, transparent 75%, #ccc 75%),
+                          linear-gradient(-45deg, transparent 75%, #ccc 75%);
+        background-size: 80px 80px; /* Creates 40px squares */
+        background-position: 0 0, 0 40px, 40px -40px, -40px 0px;
+    }
+    /* Ensure images inside checkerboard are visible */
+    .image-comparison .checkerboard-bg img {
+        position: relative; /* Ensure image is above the background */
+        z-index: 1;
+    }
+  </style>
+</head>
+<body>
+  <div class="container mt-4">
+    <div class="row justify-content-center">
+      <div class="col-12 col-lg-10 col-xl-8"> <!-- Single column layout -->
+
+        <h1 class="mb-3">Gemini API Image Mask Visualization</h1>
+
+        <div class="mb-3">
+          <label for="modelSelect" class="form-label">Select Model:</label>
+          <select id="modelSelect" class="form-select">
+            <option value="gemini-2.5-flash-preview-04-17" data-non-thinking="true">
+              gemini-2.5-flash-preview-04-17 (non thinking)
+            </option>
+            <option value="gemini-2.5-flash-preview-04-17">gemini-2.5-flash-preview-04-17</option>
+            <option value="gemini-2.5-pro-exp-03-25">gemini-2.5-pro-exp-03-25</option>
+          </select>
+        </div>
+
+        <div class="mb-3">
+            <label for="imageInput" class="form-label">Upload Image:</label>
+            <input type="file" id="imageInput" class="form-control" accept="image/*" />
+        </div>
+
+        <div id="imageContainer" class="mb-3">
+          <img id="imagePreview" alt="Image preview" style="display: none;" class="img-fluid rounded" />
+        </div>
+
+        <button id="clearImageBtn" class="btn btn-secondary mb-3">Clear Image</button>
+
+        <div class="mb-3">
+            <label for="promptInput" class="form-label">Prompt:</label>
+            <textarea id="promptInput" class="form-control" rows="4">
+Output a JSON list of segmentation masks where each entry contains: "box_2d" the 2D bounding box, "label" a brief description using one or two words or a short sentence and/or OCR of the text within the mask, "mask" the mask.
+            </textarea>
+        </div>
+
+
+        <button id="submitBtn" class="btn btn-primary mb-3">Process</button>
+
+        <div id="result"></div>
+        <div id="tokenUsage" class="mb-3"></div>
+
+        <div id="imageCanvasContainer" class="mb-3"> <!-- Renamed for clarity -->
+          <canvas id="canvas" class="border rounded"></canvas>
+        </div>
+
+        <div id="boundingBoxImages"></div>
+
+      </div> <!-- End col -->
+    </div> <!-- End row -->
+  </div> <!-- End container -->
+
+  <!-- Bootstrap 5 JS Bundle -->
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+</body>
+</html>
