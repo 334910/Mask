@@ -6,15 +6,16 @@ Fork of Simon Willison’s example Gemini Mask tool. April '25.
  
  https://github.com/simonw/tools
  
-## Demo
-
-https://334910.github.io/Mask/
 
 ## Changes
 
 - Added a PNG output using the mask as the alpha channel.
 - Added brief object labels/descriptions.
 - Some styling.
+
+## Demo
+
+https://334910.github.io/Mask/
 
 ## Screenshot
 
