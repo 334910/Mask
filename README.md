@@ -8,9 +8,7 @@ Fork of Simon Willison’s example Gemini Mask tool. April '25.
  
 ## Demo
 
-[Demo](.)
- 
-(Githup pages set to docs directory)
+https://334910.github.io/Mask/
 
 ## Changes
 
