@@ -7,7 +7,11 @@ Fork of Simon Willison’s example Gemini Mask tool. April '25.
  https://github.com/simonw/tools
  
 ## Demo
+
+[Demo](.)
  
+(Githup pages set to docs directory)
+
 ## Changes
 
 - Added a PNG output using the mask as the alpha channel.
